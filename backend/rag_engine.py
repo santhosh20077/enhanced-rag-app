@@ -12,8 +12,7 @@ import fitz  # PyMuPDF
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
+from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -57,13 +56,9 @@ class ProcessingTask:
 class RAGEngine:
     def __init__(self):
         self._lock = threading.Lock()
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={
-                "normalize_embeddings": True,
-                "batch_size": settings.EMBED_BATCH_SIZE,
-            }
+        self.embeddings = NVIDIAEmbeddings(
+            model="NV-Embed-QA",
+            nvidia_api_key=settings.NVIDIA_API_KEY
         )
         self.vector_store: FAISS = None
         self.index_path = settings.DATA_DIR / "faiss_index"
