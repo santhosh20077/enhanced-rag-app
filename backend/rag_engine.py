@@ -7,7 +7,7 @@ import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
 
-import fitz  # PyMuPDF — 50x faster than PyPDF2
+import fitz  # PyMuPDF
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -70,9 +70,10 @@ class RAGEngine:
         self.processed_files: set = set()
         self.total_chunks: int = 0
 
-        # Background processing state
+        # Background processing state & conversation memory
         self._processing_tasks: Dict[str, ProcessingTask] = {}
         self._is_processing = False
+        self.chat_history: Dict[str, list] = {}
 
         self._load_vector_store()
 
@@ -106,14 +107,8 @@ class RAGEngine:
             return task.to_dict()
         return None
 
-    # =================================================================
-    #  BLAZING FAST PDF EXTRACTION WITH PYMUPDF
-    # =================================================================
     def _extract_text_pymupdf(self, content: bytes, filename: str) -> List[Document]:
-        """
-        Extract text from PDF using PyMuPDF (fitz).
-        PyMuPDF is written in C and is 50-100x faster than PyPDF2.
-        """
+        """Extract text from PDF using PyMuPDF (fitz)."""
         documents = []
         try:
             doc = fitz.open(stream=content, filetype="pdf")
@@ -133,19 +128,6 @@ class RAGEngine:
             print(f"[RAGEngine] Error extracting {filename} with PyMuPDF: {e}")
         return documents
 
-    # =================================================================
-    #  PROGRESSIVE INDEXING — THE KEY TO INSTANT AVAILABILITY
-    # =================================================================
-    #
-    #  Instead of embedding ALL chunks before the user can search,
-    #  we split chunks into micro-batches:
-    #
-    #  1. First batch (30 chunks) → indexed in ~1-2 seconds → SEARCHABLE NOW
-    #  2. Remaining chunks → indexed in background batches of 100
-    #  3. User can chat IMMEDIATELY after first batch completes
-    #
-    # =================================================================
-
     def start_background_ingest(self, files_data: List[Tuple[str, bytes]]) -> str:
         """Starts background ingestion with progressive indexing. Returns instantly."""
         task_id = str(uuid.uuid4())[:8]
@@ -162,17 +144,11 @@ class RAGEngine:
         return task_id
 
     def _progressive_ingest_worker(self, task: ProcessingTask, files_data: List[Tuple[str, bytes]]):
-        """
-        PROGRESSIVE INDEXING WORKER:
-        Phase 1: Parse ALL pages with PyMuPDF (sub-second for most PDFs)
-        Phase 2: Chunk all text (instant)
-        Phase 3: Index FIRST BATCH immediately → user can search NOW
-        Phase 4: Index remaining chunks in background batches
-        """
+        """PROGRESSIVE INDEXING WORKER"""
         try:
             t0 = time.time()
 
-            # ━━━━ PHASE 1: BLAZING FAST PDF PARSING (PyMuPDF) ━━━━
+            # PHASE 1: PDF PARSING
             task.status = "parsing"
             task.stage_label = "Extracting text with PyMuPDF..."
             task.progress = 0.0
@@ -195,7 +171,7 @@ class RAGEngine:
                 self._is_processing = False
                 return
 
-            # ━━━━ PHASE 2: CHUNKING (instant) ━━━━
+            # PHASE 2: CHUNKING
             task.status = "chunking"
             task.stage_label = f"Splitting {len(all_documents)} pages into chunks..."
             task.progress = 0.20
@@ -212,7 +188,7 @@ class RAGEngine:
             chunk_time = time.time() - t0
             print(f"[RAGEngine] Created {len(all_chunks)} chunks in {chunk_time:.2f}s total")
 
-            # ━━━━ PHASE 3: FIRST BATCH — INSTANT AVAILABILITY ━━━━
+            # PHASE 3: FIRST BATCH — INSTANT AVAILABILITY
             first_batch_size = min(settings.FIRST_BATCH_SIZE, len(all_chunks))
             first_batch = all_chunks[:first_batch_size]
             remaining_chunks = all_chunks[first_batch_size:]
@@ -232,7 +208,6 @@ class RAGEngine:
             first_batch_time = time.time() - t0
             print(f"[RAGEngine] FIRST BATCH INDEXED in {first_batch_time:.2f}s -- SEARCHABLE NOW!")
 
-            # If no remaining chunks, we're done
             if not remaining_chunks:
                 with self._lock:
                     self._save_vector_store()
@@ -243,7 +218,7 @@ class RAGEngine:
                 self._is_processing = False
                 return
 
-            # ━━━━ PHASE 4: BACKGROUND BATCHES (user can already chat!) ━━━━
+            # PHASE 4: BACKGROUND BATCHES
             task.status = "background"
             total_remaining = len(remaining_chunks)
             batch_size = settings.BACKGROUND_BATCH_SIZE
@@ -258,10 +233,9 @@ class RAGEngine:
 
                 indexed_so_far += len(batch)
                 task.chunks_indexed = indexed_so_far
-                # Progress: 0.40 to 0.95 range for background batches
                 task.progress = 0.40 + 0.55 * (indexed_so_far / task.chunks_created)
 
-            # ━━━━ SAVE & FINALIZE ━━━━
+            # SAVE & FINALIZE
             task.status = "saving"
             task.stage_label = "Saving index to disk..."
             task.progress = 0.97
@@ -275,6 +249,14 @@ class RAGEngine:
             task.stage_label = f"Done! {task.pages_extracted} pages -> {task.chunks_created} chunks in {task.elapsed}s"
             self._is_processing = False
             print(f"[RAGEngine] FULL INGEST COMPLETE: {task.pages_extracted} pages, {task.chunks_created} chunks, {task.elapsed}s")
+
+        except Exception as e:
+            task.status = "error"
+            task.error = str(e)
+            task.stage_label = f"Error during ingestion: {e}"
+            self._is_processing = False
+            print(f"[RAGEngine] Ingestion error: {e}")
+
     def clear(self):
         """Clears vector store and memory."""
         with self._lock:
@@ -294,16 +276,13 @@ class RAGEngine:
         if not self.vector_store:
             return "No documents have been uploaded yet. Please upload PDF files first.", []
 
-        # Get existing chat history for session (keep last 5 turns)
         history = self.chat_history.get(session_id, [])
         recent_history = history[-5:]
 
-        # Setup LLM API key
         api_key = user_api_key or settings.NVIDIA_API_KEY
         if not api_key:
             return "NVIDIA API Key is missing. Please provide your API key in the sidebar.", []
 
-        # Formulate standalone contextual search query for retrieval using LLM if there is prior history
         search_query = question
         if recent_history:
             try:
@@ -327,14 +306,12 @@ class RAGEngine:
                 last_user_q = recent_history[-1][0]
                 search_query = f"{last_user_q} {question}"
 
-        # 1. Retrieve top-k documents
         retriever = self.vector_store.as_retriever(
             search_type="similarity",
             search_kwargs={"k": settings.TOP_K}
         )
         retrieved_docs: List[Document] = retriever.invoke(search_query)
 
-        # 2. Format context with explicit page tags
         context_parts = []
         sources: List[SourceDocument] = []
 
@@ -352,7 +329,6 @@ class RAGEngine:
 
         context_str = "\n\n---\n\n".join(context_parts)
 
-        # 3. Invoke LLM with Chat History
         try:
             llm = ChatNVIDIA(
                 model=settings.LLM_MODEL,
@@ -377,19 +353,16 @@ Context:
 {context_str}""")
             ]
 
-            # Inject recent chat history turns
             for u_msg, a_msg in recent_history:
                 prompt_messages.append(("human", u_msg))
                 prompt_messages.append(("ai", a_msg))
 
-            # Current question
             prompt_messages.append(("human", question))
 
             prompt = ChatPromptTemplate.from_messages(prompt_messages)
             chain = prompt | llm | StrOutputParser()
             answer = chain.invoke({})
 
-            # Save to conversation memory
             if session_id not in self.chat_history:
                 self.chat_history[session_id] = []
             self.chat_history[session_id].append((question, answer))
