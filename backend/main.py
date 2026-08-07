@@ -5,16 +5,16 @@ from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
-from .models import ChatRequest, ChatResponse, UploadResponse, StatusResponse, ProcessingProgress, AuthVerifyRequest, AuthVerifyResponse, AuthUser
+from .models import ChatRequest, ChatResponse, UploadResponse, StatusResponse, ProcessingProgress, AuthVerifyRequest, AuthVerifyResponse, AuthUser, FileDetail
 from .rag_engine import rag_engine
 from .config import settings
 
 app = FastAPI(
     title="Production RAG Web Application",
     description="Full-Stack Retrieval-Augmented Generation API powered by NVIDIA LLM & FAISS",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -73,24 +73,60 @@ async def get_progress(task_id: str):
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Processes user query against index and calls NVIDIA LLM."""
+    """Processes user query against index and calls NVIDIA LLM (non-streaming)."""
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    answer, sources = rag_engine.query(
+    answer, sources, confidence, suggestions = rag_engine.query(
         question=request.question,
-        user_api_key=request.api_key
+        session_id=request.session_id,
+        eli5_mode=request.eli5_mode,
+        attachments=request.attachments
     )
-    return ChatResponse(answer=answer, sources=sources)
+    return ChatResponse(
+        answer=answer,
+        sources=sources,
+        confidence_score=confidence,
+        follow_up_suggestions=suggestions
+    )
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """Streams AI response token-by-token via Server-Sent Events (SSE)."""
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    print(f"[Chat] Stream request: {len(request.attachments)} attachment(s), session={request.session_id}")
+
+    return StreamingResponse(
+        rag_engine.query_stream(
+            question=request.question,
+            session_id=request.session_id,
+            eli5_mode=request.eli5_mode,
+            attachments=request.attachments
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
 
 @app.get("/api/status", response_model=StatusResponse)
 async def get_status():
-    """Returns vector store status and file count."""
+    """Returns vector store status, file count, and detailed file metadata."""
+    file_details_list = list(rag_engine.file_details.values())
     return StatusResponse(
         is_ready=rag_engine.vector_store is not None,
         total_chunks=rag_engine.total_chunks,
         filenames=list(rag_engine.processed_files),
-        is_processing=rag_engine.is_processing
+        is_processing=rag_engine.is_processing,
+        file_details=file_details_list,
+        total_indexing_time=rag_engine.total_indexing_time,
+        avg_chunk_size=rag_engine.avg_chunk_size
     )
 
 @app.delete("/api/clear")
@@ -99,13 +135,30 @@ async def clear_data():
     rag_engine.clear()
     return {"message": "Vector store and session memory cleared."}
 
+
+@app.delete("/api/files/{filename}")
+async def remove_file(filename: str):
+    """Removes a single file from the index."""
+    success = rag_engine.remove_file(filename)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found in index.")
+    return {"message": f"File '{filename}' removed from index.", "filename": filename}
+
+
+@app.post("/api/summarize/{filename}")
+async def summarize_file(filename: str):
+    """Generates a summary of a specific uploaded file."""
+    summary = rag_engine.summarize_file(filename)
+    return {"filename": filename, "summary": summary}
+
+
 @app.get("/api/config")
 async def get_config():
     """Returns public config like GOOGLE_CLIENT_ID to the frontend."""
     return {
-        "google_client_id": settings.GOOGLE_CLIENT_ID,
-        "has_nvidia_key": bool(settings.NVIDIA_API_KEY)
+        "google_client_id": settings.GOOGLE_CLIENT_ID
     }
+
 
 @app.post("/api/auth/verify", response_model=AuthVerifyResponse)
 async def verify_auth(request: AuthVerifyRequest):
@@ -161,7 +214,8 @@ if frontend_dir.exists():
 
     @app.get("/")
     async def serve_index():
-        return FileResponse(frontend_dir / "index.html")
+        formal_ui = frontend_dir / "formal.html"
+        return FileResponse(formal_ui if formal_ui.exists() else frontend_dir / "index.html")
 
 if __name__ == "__main__":
     import uvicorn
